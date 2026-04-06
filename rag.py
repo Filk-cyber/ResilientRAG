@@ -279,7 +279,7 @@ def retrieve_documents_by_similarity_andCredibility(question: str, ctxs: List[Di
     ctxs = ctxs[:end_index + args.fake_num]
     for i, ctx in enumerate(ctxs):
         # Use only text content as retrieval document
-        documents.append(ctx["text"])
+        documents.append("title: {}, text: {}".format(ctx["title"], ctx["text"]))
         if ideal_setting:
             if i < end_index:
                 truthful_scores.append(10)
