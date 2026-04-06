@@ -8,7 +8,6 @@ from typing import List, Dict
 
 import torch
 from torch import Tensor
-import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import logging as hf_logging
@@ -18,6 +17,8 @@ hf_logging.set_verbosity_error()
 from utils.utils import *
 from utils.const import HF_TOKEN
 from retrievers.e5_mistral import get_e5_mistral_embeddings_for_query, get_e5_mistral_embeddings_for_document
+from retrievers.dragon_plus import get_dragon_plus_embeddings_for_query, get_dragon_plus_embeddings_for_document
+from retrievers.e5 import get_e5_embeddings_for_query, get_e5_embeddings_for_document
 
 tokenizer = None
 model = None
@@ -27,9 +28,7 @@ choices_token_ids_list = None
 tokenizer_name_or_path = "Meta-Llama-3-8B-Instruct"
 model_name_or_path = "Meta-Llama-3-8B-Instruct"
 device = torch.device("cuda")
-
-
-FIXED_WEIGHT = 0.4
+print(tokenizer_name_or_path)
 
 def setup_parser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -50,80 +49,10 @@ def setup_parser():
     parser.add_argument("--calculate_ranked_prompt_indices", action="store_true",
                         help="whether to use retriever to adaptively choose demonstrations")
     parser.add_argument("--fake_num", type=int, default=1)
-    parser.add_argument("--scoring_function", type=str, default="linear",
-                        choices=["linear", "relu", "mlp"],
-                        help="Type of scoring function: linear (original), relu (ReLU-based) or mlp (small MLP)")
-    parser.add_argument("--contrast", action="store_true",
-                        help="Compare the performance of Linear, ReLU and MLP scoring functions")
-    parser.add_argument("--calculate_time", action="store_true",
-                        help="whether to calculate time for each chain")
+    parser.add_argument("--weight", type=float, default=0.9,
+                        help="weight for similarity score in fusion score calculation (0.0-1.0)")
     args = parser.parse_args()
     return args
-
-# ===== Scoring Function Model Definitions =====
-class LinearScoringFunction(nn.Module):
-    """Linear scoring function"""
-
-    def __init__(self, weight=FIXED_WEIGHT):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, similarity_scores, truthful_scores):
-        return self.weight * similarity_scores + (1 - self.weight) * truthful_scores
-
-
-class ReLUScoringFunction(nn.Module):
-    """ReLU-based scoring function"""
-
-    def __init__(self, weight=FIXED_WEIGHT):
-        super().__init__()
-        self.weight = weight
-        self.relu = nn.ReLU()
-
-    def forward(self, similarity_scores, truthful_scores):
-        combined = self.weight * similarity_scores + (1 - self.weight) * truthful_scores
-        return self.relu(combined)
-
-
-class MLPScoringFunction(nn.Module):
-    """MLP-based scoring function"""
-
-    def __init__(self, weight=FIXED_WEIGHT, input_dim=3, hidden_dim=8):
-        super().__init__()
-        self.weight = weight
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        self._initialize_weights()
-        self.mlp = self.mlp.to(torch.bfloat16)
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)  # Smaller initialization
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, similarity_scores, truthful_scores):
-        weighted_combination = self.weight * similarity_scores + (1 - self.weight) * truthful_scores
-        features = torch.stack([similarity_scores, truthful_scores, weighted_combination], dim=-1)
-        features = features.to(torch.bfloat16)
-        output = self.mlp(features)
-        return output.squeeze(-1)
-
-def get_scoring_function(scoring_type: str):
-    if scoring_type == "linear":
-        return LinearScoringFunction().to(device)
-    elif scoring_type == "relu":
-        return ReLUScoringFunction().to(device)
-    elif scoring_type == "mlp":
-        return MLPScoringFunction().to(device)
-    else:
-        raise ValueError(f"Unsupported scoring function type: {scoring_type}")
 
 
 def get_tokenizer():
@@ -239,6 +168,10 @@ def get_llama3_generate_reasoning_chains_prompts_chat_format(
             examplars = vary_num_examplars_based_on_context_window(instruction, examplars, question, triples,
                                                                    candidates)
             instruction += convert_several_examplars_to_text(examplars)
+            # Here, possible_prompt="{} {}\n\nquestion: {}\nknowledge triples: {}\ncandidate knowledge triples:\n{}\nanswer:".format() 
+            # is used in vary_num_examplars_based_on_context_window to try packing everything (instructions, examplars, existing conditions, and the blank 'answer:') 
+            # into the prompt, checking if the encoded tokens exceed args.max_length.
+            # If it exceeds, it reduces them one by one; if not, it directly returns the examplars list, and the elements will be joined by \n\n elsewhere.
         else:
             instruction += "\n\n"
 
@@ -246,7 +179,7 @@ def get_llama3_generate_reasoning_chains_prompts_chat_format(
             hop + 1, ", ".join(triples), question, convert_candidate_triples_to_choices(candidates)
         )
         prompts.append(
-            [
+            [  # instruction: first give the requirements, then the examplars and known conditions, and finally provide the blank for 'the next possible triple is:' in the user content
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": user_input_text}
             ]
@@ -276,7 +209,7 @@ def model_generate(inputs: Dict[str, Tensor], max_new_tokens: int = 100, batch_s
         batch_inputs = to_device(batch_inputs, device)
         batch_outputs = model.generate(**batch_inputs, max_new_tokens=max_new_tokens, output_scores=True,
                                        return_dict_in_generate=True, do_sample=False,
-                                       temperature=1.0)
+                                       temperature=1.0)  # temperature=1.5, do_sample=True) #
         batch_generated_token_ids = batch_outputs.sequences[:, batch_inputs["input_ids"].shape[1]:].detach().cpu()
         batch_generated_token_logits = torch.cat([token_scores.unsqueeze(1) for token_scores in batch_outputs.scores],
                                                  dim=1).detach().cpu()
@@ -322,77 +255,61 @@ def get_answer_token_indices(num_choices, token_ids):
 
 def construct_reasoning_chains(args, ideal_setting: bool = True):
     """
-    Main function: Construct reasoning chains, supporting comparative experiments for Linear, ReLU, and MLP scoring functions.
+    (2) REASONING CHAIN CONSTRUCTION STEP: Main function that constructs reasoning chains from knowledge graph triples
+
+    This function builds coherent reasoning paths through knowledge triples to answer multi-hop questions by:
+    1. Loading knowledge triples from the KG generated in step 1
+    2. Computing embeddings for these triples using a retrieval model
+    3. Iteratively constructing reasoning paths by selecting relevant triples:
+       a. For each partial path, find candidate triples using embedding similarity
+       b. Guide the LLM to select the best next triple or determine the path is complete
+       c. Maintain multiple candidate paths using beam search
+    4. Storing the highest-scoring paths for each question
+
+    Args:
+        args: Contains parameters for processing data, chain length, models, etc.
     """
-
-    if args.contrast:
-        print("=== Comparing Linear, ReLU, and MLP scoring functions ===")
-        print(f"All three methods use fixed weight: {FIXED_WEIGHT}")
-
-        results = {}
-        scoring_functions = {
-            "linear": get_scoring_function("linear"),
-            "relu": get_scoring_function("relu"),
-            "mlp": get_scoring_function("mlp")
-        }
-
-        for func_name, func in scoring_functions.items():
-            print(f"\n--- Processing with {func_name.upper()} scoring function ---")
-            result_file = construct_reasoning_chains_with_scoring_function(args, func, func_name, ideal_setting)
-            results[func_name] = result_file
-
-        print(f"\n=== Contrast experiment completed ===")
-        print("Generated files:")
-        for func_name, file_path in results.items():
-            print(f"  {func_name}: {file_path}")
-        print("\nNext step: Run evaluation.py on each file to compare performance metrics and time complexity")
-        return
-
-    # ===== Handle single scoring function case =====
-    scoring_function = get_scoring_function(args.scoring_function)
-    print(f"Using {args.scoring_function} scoring function with fixed weight {FIXED_WEIGHT}...")
-    construct_reasoning_chains_with_scoring_function(args, scoring_function, args.scoring_function, ideal_setting)
-
-
-def construct_reasoning_chains_with_scoring_function(args, scoring_function, scoring_function_name="linear",
-                                                     ideal_setting: bool = True):
-    """Construct reasoning chains using the specified scoring function"""
     print("ideal_setting:", ideal_setting)
     data_file, save_data_file = args.input_data_file, args.save_data_file
 
-    # Create different save files for different scoring functions
-    base_name, ext = os.path.splitext(save_data_file)
-    save_data_file = f"{base_name}_{scoring_function_name}_w{FIXED_WEIGHT}{ext}"
-
-    if os.path.exists(save_data_file) and not args.calculate_time:
+    if os.path.exists(save_data_file):
         print(f"{save_data_file} already exists, skip this ...")
-        return save_data_file
+        return
 
     print(f"loading data from {data_file} ... ")
     data = load_json(data_file)
-
-    # Record start time to measure inference efficiency
-    start_time = time.time()
 
     if args.calculate_ranked_prompt_indices:
         _, reasoning_chains_examplars = get_dataset_demonstrations(args.dataset)
         questions_in_examplars = [item["question"] for item in reasoning_chains_examplars]
         questions_in_data = [item["question"] for item in data]
-        print("Calculating E5-Mistral Embeddings of Questions in Prompts ... ")
-        questions_in_prompts_embeddings = get_e5_mistral_embeddings_for_document(questions_in_examplars,
-                                                                                 max_length=128, batch_size=2)
-        print("Calculating E5-Mistral Embeddings of Questions in Data ... ")
-        questions_in_data_embeddings = get_e5_mistral_embeddings_for_document(questions_in_data, max_length=128,
-                                                                              batch_size=2)
+        if args.ranking_model == "e5_mistral":
+            print("Calculating E5-Mistral Embeddings of Questions in Prompts ... ")
+            questions_in_prompts_embeddings = get_e5_mistral_embeddings_for_document(questions_in_examplars,
+                                                                                     max_length=128, batch_size=2)
+            print("Calculating E5-Mistral Embeddings of Questions in Data ... ")
+            questions_in_data_embeddings = get_e5_mistral_embeddings_for_document(questions_in_data, max_length=128,
+                                                                                  batch_size=2)
+        elif args.ranking_model == "dragon_plus":
+            print("Calculating DRAGON+ Embeddings of Questions in Prompts ... ")
+            questions_in_prompts_embeddings = get_dragon_plus_embeddings_for_query(questions_in_examplars,
+                                                                                   max_length=128, batch_size=2)
+            print("Calculating DRAGON+ Embeddings of Questions in Data ... ")
+            questions_in_data_embeddings = get_dragon_plus_embeddings_for_query(questions_in_data, max_length=128,
+                                                                                batch_size=2)
+        elif args.ranking_model == "e5":
+            print("Calculating E5 Embeddings of Questions in Prompts ... ")
+            questions_in_prompts_embeddings = get_e5_embeddings_for_query(questions_in_examplars, max_length=128,
+                                                                          batch_size=2)
+            print("Calculating E5 Embeddings of Questions in Data ... ")
+            questions_in_data_embeddings = get_e5_embeddings_for_query(questions_in_data, max_length=128, batch_size=2)
         similarities = torch.matmul(questions_in_data_embeddings, questions_in_prompts_embeddings.T)
         ranked_prompt_indices = torch.argsort(similarities, dim=1, descending=True)
         for example, one_ranked_prompt_indices in zip(data, ranked_prompt_indices):
             example["ranked_prompt_indices"] = one_ranked_prompt_indices.tolist()
 
     global tokenizer, token_id_to_choice_map
-    total_scoring_time = 0.0  # Record scoring computation time
-
-    for example in tqdm(data, desc=f"Generating reasoning chains with {scoring_function_name}", total=len(data)):
+    for example in tqdm(data, desc="Generating reasoning chains", total=len(data)):
 
         question = example["question"]
         triples, triple_positions = [], []
@@ -411,11 +328,15 @@ def construct_reasoning_chains_with_scoring_function(args, scoring_function, sco
                 else:
                     truthful_scores.append(triple_item["triple_truthful_score"])
 
-        truthful_scores_tensor = torch.tensor(truthful_scores, dtype=torch.bfloat16).to(device) / 10.0
-
+        truthful_scores_tensor = torch.tensor(truthful_scores, dtype=torch.bfloat16) / 10.0
         # Compute embeddings for all knowledge triples to enable similarity-based retrieval
         num_total_triples = len(triples)
-        triples_embeddings = get_e5_mistral_embeddings_for_document(triples, max_length=128, batch_size=2)
+        if args.ranking_model == "e5_mistral":
+            triples_embeddings = get_e5_mistral_embeddings_for_document(triples, max_length=128, batch_size=2)
+        elif args.ranking_model == "dragon_plus":
+            triples_embeddings = get_dragon_plus_embeddings_for_document(triples, max_length=128, batch_size=2)
+        elif args.ranking_model == "e5":
+            triples_embeddings = get_e5_embeddings_for_document(triples, max_length=128, batch_size=2)
         triples_embeddings = torch.nn.functional.normalize(triples_embeddings, p=2, dim=-1)
 
         # Initialize beam search with empty paths
@@ -437,23 +358,23 @@ def construct_reasoning_chains_with_scoring_function(args, scoring_function, sco
             ]
 
             # Get embeddings for current path + question combinations
-            queries_embeddings = get_e5_mistral_embeddings_for_query("retrieve_relevant_triples", queries,
-                                                                     max_length=256, batch_size=1)
-
+            if args.ranking_model == "e5_mistral":
+                queries_embeddings = get_e5_mistral_embeddings_for_query("retrieve_relevant_triples", queries,
+                                                                         max_length=256, batch_size=1)
+            elif args.ranking_model == "dragon_plus":
+                queries_embeddings = get_dragon_plus_embeddings_for_query(queries, max_length=256, batch_size=2)
+            elif args.ranking_model == "e5":
+                queries_embeddings = get_e5_embeddings_for_query(queries, max_length=256, batch_size=2)
             queries_embeddings = torch.nn.functional.normalize(queries_embeddings, p=2, dim=-1)
 
             # Calculate the scores between queries and all triples
-            queries_triples_similarities = torch.matmul(queries_embeddings, triples_embeddings.T).to(device)
+            queries_triples_similarities = torch.matmul(queries_embeddings, triples_embeddings.T)  # n_path, n_triples
             expanded_truthful_scores = truthful_scores_tensor.unsqueeze(0).expand(queries_triples_similarities.shape[0],
                                                                                   -1)
+            
+            queries_triples_similarities = args.weight * queries_triples_similarities + (
+                            1 - args.weight) * expanded_truthful_scores
 
-            scoring_start_time = time.time()
-            queries_triples_similarities = scoring_function.forward(
-                queries_triples_similarities, expanded_truthful_scores
-            )
-            total_scoring_time += (time.time() - scoring_start_time) * 1000
-            if args.calculate_time:
-                continue
             # Mask out triples already used in each path
             candidate_triples_mask = torch.ones_like(queries_triples_similarities)
             for k, path in enumerate(paths):
@@ -467,6 +388,7 @@ def construct_reasoning_chains_with_scoring_function(args, scoring_function, sco
                 torch.topk(queries_triples_similarities, k=min(args.num_choices, num_total_triples), dim=1)[1].tolist()
 
             # Create prompts for LLM to select the next triple for each path
+            # Here we get multiple prompts for multiple queries, such as path[[1,2],[1,3],[1,4]...]
             prompts = get_llama3_generate_reasoning_chains_prompts_chat_format(
                 args=args,
                 hop=j,
@@ -517,6 +439,7 @@ def construct_reasoning_chains_with_scoring_function(args, scoring_function, sco
                     if torch.isnan(topk_choices_probs[i, b]) or topk_choices_probs[i, b].item() < args.min_triple_prob:
                         continue
                     current_choice = choices_list[topk_choices_indices[i, b].item()]
+                    # Actually, B-F here correspond to the most relevant to the second most relevant... fifth most relevant options
                     if current_choice != 'A' and (
                             ord(current_choice) - ord('B') >= len(topk_most_relevant_triples_indices[i])):
                         continue
@@ -526,7 +449,7 @@ def construct_reasoning_chains_with_scoring_function(args, scoring_function, sco
                         new_paths.append(paths[i] + [-1])
                         new_paths_finished.append(True)
                     else:
-                        # Add the selected triple to the path
+                        # Add the selected triple to the path, record the probability index
                         new_paths.append(
                             paths[i] + [topk_most_relevant_triples_indices[i][ord(current_choice) - ord('B')]])
                         new_paths_finished.append(False)
@@ -556,28 +479,9 @@ def construct_reasoning_chains_with_scoring_function(args, scoring_function, sco
             for path, path_score in zip(paths, paths_scores)
         ]
 
-    example_count = len(data)
-    avg_scoring_time_per_example = total_scoring_time / example_count
-    if args.calculate_time:
-        print(f"\n=== {scoring_function_name.upper()} Performance Statistics ===")
-        print(f"Total scoring computation time: {total_scoring_time:.2f} ms")
-        print(f"Average scoring time per example: {avg_scoring_time_per_example:.6f} ms")
-        print(f"Using fixed weight: {FIXED_WEIGHT}")
-    else:
-        total_time = time.time() - start_time
-        avg_inference_time_per_example = total_time / example_count
-        print(f"\n=== {scoring_function_name.upper()} Performance Statistics ===")
-        print(f"Total examples processed: {example_count}")
-        print(f"Total inference time: {total_time:.2f} seconds")
-        print(f"Average time per example: {avg_inference_time_per_example:.3f} seconds")
-        print(f"Total scoring computation time: {total_scoring_time:.2f} seconds")
-        print(f"Average scoring time per example: {avg_scoring_time_per_example:.6f} seconds")
-        print(f"Using fixed weight: {FIXED_WEIGHT}")
-        print(f"saving data to {save_data_file} ... ")
-        os.makedirs(os.path.dirname(save_data_file), exist_ok=True)
-        save_json(data, save_data_file, use_indent=True)
-
-    return save_data_file
+    print(f"saving data to {save_data_file} ... ")
+    os.makedirs(os.path.dirname(save_data_file), exist_ok=True)
+    save_json(data, save_data_file, use_indent=True)
 
 
 if __name__ == "__main__":
