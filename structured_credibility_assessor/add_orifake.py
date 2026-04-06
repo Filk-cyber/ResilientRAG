@@ -627,7 +627,7 @@ def main():
     """
     # Configuration parameters
     API_KEY = ""  # Please fill in your ZhipuAI API Key
-    INPUT_FILE = "/wiki_test1000_add_wronganswer.json"
+    INPUT_FILE = "wiki_test1000_add_wronganswer.json"
     OUTPUT_FILE = "wiki_test1000_add_orifake.json"
 
     # Parallel processing parameters
