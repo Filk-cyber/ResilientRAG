@@ -251,7 +251,7 @@ def get_answer_token_indices(num_choices, token_ids):
     return answer_token_indices
 
 
-def construct_reasoning_chains(args, ideal_setting: bool = False):
+def construct_reasoning_chains(args):
     """
     (2) REASONING CHAIN CONSTRUCTION STEP: Main function that constructs reasoning chains from knowledge graph triples
 
