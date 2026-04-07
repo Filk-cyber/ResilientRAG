@@ -140,7 +140,6 @@ def get_file_prefix(file_name):
     return file_prefix
 
 def string_fuzzy_match(text1, text2):
-    # Levenshtein会受到句子长度的影响，在这里不是很合适
     # import Levenshtein
     # return Levenshtein.distance(text1, text2)
     import jellyfish
